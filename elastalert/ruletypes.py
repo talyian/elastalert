@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
+import bisect
 import datetime
-from collections import deque
 
+import blist
 from elasticsearch.client import Elasticsearch
 from util import dt_to_ts
 from util import EAException
@@ -243,22 +244,31 @@ class EventWindow(object):
         self.timeframe = timeframe
         self.onRemoved = onRemoved
         self.get_ts = getTimestamp
-        self.data = deque()
+        self.data = blist.blist()
+        self.timestamps = blist.blist()
         self.running_count = 0
+
+    def clear_data(self):
+        self.data = blist.blist()
+        self.timestamps = blist.blist()
 
     def append(self, event):
         """ Add an event to the window. Event should be of the form (dict, count).
         This will also pop the oldest events and call onRemoved on them until the
         window size is less than timeframe. """
-        # If the event occurred before our 'latest' event
         if len(self.data) and self.get_ts(self.data[-1]) > self.get_ts(event):
-            self.append_middle(event)
+            i = bisect.bisect(self.timestamps, self.get_ts(event))
+            self.data.insert(i, event)
+            self.timestamps.insert(i, self.get_ts(event))
         else:
             self.data.append(event)
-            self.running_count += event[1]
+            self.timestamps.append(self.get_ts(event))
+
+        self.running_count += event[1]
 
         while self.duration() >= self.timeframe:
-            oldest = self.data.popleft()
+            self.timestamps.pop(0)
+            oldest = self.data.pop(0)
             self.running_count -= oldest[1]
             self.onRemoved and self.onRemoved(oldest)
 
@@ -274,29 +284,6 @@ class EventWindow(object):
 
     def __iter__(self):
         return iter(self.data)
-
-    def append_middle(self, event):
-        """ Attempt to place the event in the correct location in our deque.
-        Returns True if successful, otherwise False. """
-        rotation = 0
-        ts = self.get_ts(event)
-
-        # Append left if ts is earlier than first event
-        if self.get_ts(self.data[0]) > ts:
-            self.data.appendleft(event)
-            self.running_count += event[1]
-            return
-
-        # Rotate window until we can insert event
-        while self.get_ts(self.data[-1]) > ts:
-            self.data.rotate(1)
-            rotation += 1
-            if rotation == len(self.data):
-                # This should never happen
-                return
-        self.data.append(event)
-        self.running_count += event[1]
-        self.data.rotate(-rotation)
 
 
 class SpikeRule(RuleType):
@@ -344,8 +331,8 @@ class SpikeRule(RuleType):
 
     def clear_windows(self, qk, event):
         # Reset the state and prevent alerts until windows filled again
-        self.cur_windows[qk].data = deque()
-        self.ref_windows[qk].data = deque()
+        self.cur_windows[qk].clear_data()
+        self.ref_windows[qk].clear_data()
         self.first_event.pop(qk)
         self.skip_checks[qk] = event[self.ts_field] + self.rules['timeframe'] * 2
 
